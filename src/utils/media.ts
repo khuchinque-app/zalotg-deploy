@@ -1,0 +1,183 @@
+import axios from 'axios';
+import { createWriteStream, mkdirSync, copyFileSync } from 'fs';
+import { stat, unlink } from 'fs/promises';
+import { spawn } from 'child_process';
+import { fileURLToPath } from 'url';
+import path from 'path';
+import os from 'os';
+import { config } from '../config.js';
+
+// Local Bot API reads outgoing files from a shared host/container path.
+// macOS os.tmpdir() points to /var/folders, while our server and Docker setup
+// share /tmp, so keep bridge media there whenever local mode is enabled.
+const TMP_ROOT = config.telegram.localServer && process.platform !== 'win32'
+  ? '/tmp'
+  : os.tmpdir();
+const TMP_DIR = path.join(TMP_ROOT, 'zalo-tg');
+
+/** Keep readable Unicode filenames, but remove path/control chars unsafe on disk. */
+export function sanitizeFileName(fileName: string, fallback = `download_${Date.now()}`): string {
+  const cleaned = fileName
+    .normalize('NFC')
+    .replace(/[\\/:*?"<>|\u0000-\u001F]/g, '_')
+    .replace(/^\.+$/, '_')
+    .trim()
+    .slice(0, 180);
+  return cleaned || fallback;
+}
+
+/** Download a remote URL to a temp file. Returns the local file path.
+ *  When using a local Telegram Bot API server (--local flag), getFileLink()
+ *  returns a file:// URL pointing to the server's working directory.
+ *  In that case we copy the file directly instead of downloading via HTTP.
+ */
+export async function downloadToTemp(url: string, fileName?: string, retries = 3): Promise<string> {
+  mkdirSync(TMP_DIR, { recursive: true });
+
+  // Local Bot API server returns file:// paths — copy directly, no HTTP needed
+  if (url.startsWith('file:')) {
+    const srcPath = fileURLToPath(url);
+    const baseName = sanitizeFileName(fileName ?? path.basename(srcPath));
+    const destPath = path.join(TMP_DIR, `${Date.now()}_${Math.random().toString(36).slice(2, 7)}_${baseName}`);
+    copyFileSync(srcPath, destPath);
+    // Delete the original from local server's data dir — it's been delivered, no longer needed
+    await unlink(srcPath).catch(() => undefined);
+    return destPath;
+  }
+
+  // Sanitize filename and add a unique prefix so concurrent downloads
+  // with the same logical name (e.g. multiple 'photo.jpg' in a media group)
+  // do not overwrite each other.
+  const baseName = sanitizeFileName(fileName ?? `download_${Date.now()}`);
+
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < retries; attempt++) {
+    if (attempt > 0) {
+      // Exponential backoff: 500ms, 1500ms, ...
+      await new Promise(r => setTimeout(r, 500 * attempt * attempt));
+    }
+
+    const filePath = path.join(TMP_DIR, `${Date.now()}_${Math.random().toString(36).slice(2, 7)}_${baseName}`);
+    try {
+      const resp = await axios.get<NodeJS.ReadableStream>(url, {
+        responseType: 'stream',
+        timeout: 30_000,
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ZaloTGBridge/1.0)' },
+      });
+
+      await new Promise<void>((resolve, reject) => {
+        const writer = createWriteStream(filePath);
+        resp.data.pipe(writer);
+        writer.on('finish', resolve);
+        writer.on('error', reject);
+      });
+
+      const { size } = await stat(filePath);
+      if (size === 0) {
+        await unlink(filePath).catch(() => undefined);
+        lastErr = new Error(`Downloaded file is empty: ${url}`);
+        continue;
+      }
+
+      return filePath;
+    } catch (err) {
+      await unlink(filePath).catch(() => undefined);
+      lastErr = err;
+    }
+  }
+
+  throw lastErr;
+}
+
+/** Remove a temp file, ignoring errors. */
+export async function cleanTemp(filePath: string): Promise<void> {
+  try { await unlink(filePath); } catch { /* ignore */ }
+}
+
+/**
+ * Convert an audio file to M4A (AAC) using ffmpeg.
+ * Returns the path to the converted file (caller must clean it up).
+ */
+export async function convertToM4a(inputPath: string): Promise<string> {
+  mkdirSync(TMP_DIR, { recursive: true });
+  const outputPath = path.join(TMP_DIR, `voice_${Date.now()}.m4a`);
+  await new Promise<void>((resolve, reject) => {
+    const ff = spawn('ffmpeg', [
+      '-y', '-i', inputPath,
+      // Keep an iOS/Android-friendly AAC-LC profile and put moov atom first.
+      // Some mobile clients show "--:--" or fail playback if metadata is tail-loaded.
+      '-c:a', 'aac', '-profile:a', 'aac_low', '-b:a', '64k', '-ac', '1', '-ar', '44100',
+      '-movflags', '+faststart',
+      '-vn', outputPath,
+    ]);
+    ff.on('close', code => code === 0 ? resolve() : reject(new Error(`ffmpeg exit ${code}`)));
+    ff.on('error', reject);
+  });
+  return outputPath;
+}
+
+/**
+ * Convert a WebM video (e.g. Telegram video sticker) to GIF using ffmpeg.
+ * Returns the path to the output GIF (caller must clean it up).
+ */
+export async function convertWebmToGif(inputPath: string): Promise<string> {
+  mkdirSync(TMP_DIR, { recursive: true });
+  const outputPath = path.join(TMP_DIR, `sticker_${Date.now()}.gif`);
+  // Two-pass palette for better quality; scale to max 256px wide
+  const palettePass = path.join(TMP_DIR, `palette_${Date.now()}.png`);
+  await new Promise<void>((resolve, reject) => {
+    const ff = spawn('ffmpeg', [
+      '-y', '-i', inputPath,
+      '-vf', 'fps=15,scale=min(256\\,iw):-2:flags=lanczos,palettegen=stats_mode=diff',
+      palettePass,
+    ]);
+    ff.on('close', code => code === 0 ? resolve() : reject(new Error(`ffmpeg palettegen exit ${code}`)));
+    ff.on('error', reject);
+  });
+  await new Promise<void>((resolve, reject) => {
+    const ff = spawn('ffmpeg', [
+      '-y', '-i', inputPath, '-i', palettePass,
+      '-lavfi', 'fps=15,scale=min(256\\,iw):-2:flags=lanczos[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=5',
+      outputPath,
+    ]);
+    ff.on('close', code => code === 0 ? resolve() : reject(new Error(`ffmpeg paletteuse exit ${code}`)));
+    ff.on('error', reject);
+  });
+  await unlink(palettePass).catch(() => undefined);
+  return outputPath;
+}
+
+/**
+ * Extract the first frame of a video as a JPEG thumbnail.
+ * Returns the path to the thumbnail file (caller must clean it up).
+ */
+export async function extractVideoThumbnail(videoPath: string): Promise<string> {
+  mkdirSync(TMP_DIR, { recursive: true });
+  const outputPath = path.join(TMP_DIR, `thumb_${Date.now()}.jpg`);
+  await new Promise<void>((resolve, reject) => {
+    const ff = spawn('ffmpeg', [
+      '-y', '-i', videoPath,
+      '-vframes', '1',
+      '-q:v', '5',    // quality 1-31, lower=better; 5 is ~90% JPEG
+      '-vf', 'scale=\'min(720,iw)\':-2',  // max 720px wide, keep aspect
+      outputPath,
+    ]);
+    ff.on('close', code => code === 0 ? resolve() : reject(new Error(`ffmpeg thumb exit ${code}`)));
+    ff.on('error', reject);
+  });
+  return outputPath;
+}
+
+const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp']);
+const VIDEO_EXTS = new Set(['.mp4', '.mov', '.avi', '.mkv', '.webm', '.flv']);
+
+/** Guess media type from filename or URL. */
+export function detectMediaType(fileNameOrUrl: string): 'image' | 'video' | 'document' {
+  const lower = fileNameOrUrl.toLowerCase();
+  const ext   = path.extname(lower.split('?')[0] ?? '');
+  if (IMAGE_EXTS.has(ext)) return 'image';
+  if (VIDEO_EXTS.has(ext)) return 'video';
+  if (/\.(jpg|jpeg|png|gif|webp)(\?|$)/.test(lower)) return 'image';
+  if (/\.(mp4|mov|avi|mkv|webm)(\?|$)/.test(lower))  return 'video';
+  return 'document';
+}
